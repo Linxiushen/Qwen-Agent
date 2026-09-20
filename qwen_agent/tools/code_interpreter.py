@@ -275,10 +275,16 @@ class CodeInterpreter(BaseToolWithFileAccess):
         
         # start Docker container
         result = subprocess.run(docker_run_cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
-        if result.returncode != 0:
-            raise RuntimeError(f'Failed to start Docker container: {result.stderr}')
-        
+        # `docker run -d` creates the container object before it starts the entrypoint,
+        # so a non-zero return code can still leave a real container behind (and it
+        # still prints the id on stdout). Read the id before the error check so such a
+        # container can be removed here: `_DOCKER_CONTAINERS` is only populated by
+        # `call()` after this method returns, so nothing else will ever clean it up.
         container_id = result.stdout.strip()
+        if result.returncode != 0:
+            self._remove_container_quietly(container_id)
+            raise RuntimeError(f'Failed to start Docker container: {result.stderr}')
+
         logger.info(f"INFO: Docker container ID = {container_id}")
 
         max_wait = 30
@@ -305,6 +311,7 @@ class CodeInterpreter(BaseToolWithFileAccess):
                 encoding='utf-8',
                 errors='replace'
             )
+            self._remove_container_quietly(container_id)
             raise RuntimeError(f'Container failed to start properly. Logs:\n{logs.stdout}\n{logs.stderr}')
 
         time.sleep(2)
@@ -335,9 +342,29 @@ class CodeInterpreter(BaseToolWithFileAccess):
                         encoding='utf-8',
                         errors='replace'
                     )
+                    self._remove_container_quietly(container_id)
                     raise RuntimeError(f'Kernel failed to start: {e}\nContainer logs:\n{logs.stdout}\n{logs.stderr}')
-        
+
         return kc, container_id
+
+    @staticmethod
+    def _remove_container_quietly(container_id: str):
+        """Best-effort stop+rm for a container started here that will never be tracked.
+
+        `_DOCKER_CONTAINERS` is only populated by `call()` after `_start_kernel`
+        returns, so a container created before `_start_kernel` raises is invisible to
+        `_kill_kernels_and_containers()` and `__del__`. It would stay on the host and,
+        because the container name is derived from the deterministic
+        `{instance_id}_{pid}` kernel id, block every later attempt by the same
+        instance with a name conflict.
+        """
+        if not container_id:
+            return
+        for cmd in (['docker', 'stop', container_id], ['docker', 'rm', container_id]):
+            try:
+                subprocess.run(cmd, timeout=10, capture_output=True, encoding='utf-8', errors='replace')
+            except Exception:
+                logger.warning(f'Failed to clean up Docker container {container_id} via {cmd[1]}')
 
     def _execute_code(self, kc, code: str) -> str:
         kc.wait_for_ready()
