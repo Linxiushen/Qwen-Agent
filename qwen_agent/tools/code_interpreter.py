@@ -287,6 +287,27 @@ class CodeInterpreter(BaseToolWithFileAccess):
 
         logger.info(f"INFO: Docker container ID = {container_id}")
 
+        # From here until `return`, the container exists but is not yet tracked in
+        # `_DOCKER_CONTAINERS` (that happens in `call()` after we return). Any
+        # failure in this span - the readiness wait, the jupyter client import or
+        # construction, load_connection_file(), start_channels(), the final
+        # wait_for_ready() - must release the container, or it leaks and its
+        # deterministic name blocks every later attempt by this instance.
+        # `_connect_kernel` releases the client's channels on its own failures.
+        try:
+            kc = self._connect_kernel(container_id, host_connection_file)
+        except BaseException:
+            self._remove_container_quietly(container_id)
+            raise
+        return kc, container_id
+
+    def _connect_kernel(self, container_id: str, host_connection_file: str):
+        """Wait for the container, then build and connect a kernel client.
+
+        Raises on any failure; the caller (`_start_kernel`) owns cleanup of the
+        container and of the client's channels, so this method deliberately does
+        no cleanup of its own beyond the diagnostic `docker logs` reads.
+        """
         max_wait = 30
         wait_interval = 0.5
         elapsed = 0
@@ -311,7 +332,6 @@ class CodeInterpreter(BaseToolWithFileAccess):
                 encoding='utf-8',
                 errors='replace'
             )
-            self._remove_container_quietly(container_id)
             raise RuntimeError(f'Container failed to start properly. Logs:\n{logs.stdout}\n{logs.stderr}')
 
         time.sleep(2)
@@ -320,32 +340,40 @@ class CodeInterpreter(BaseToolWithFileAccess):
         from jupyter_client import BlockingKernelClient
 
         kc = BlockingKernelClient(connection_file=host_connection_file)
-        asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
-        kc.load_connection_file()
-        kc.start_channels()
+        # `kc` is owned here: if anything after construction fails, stop its
+        # channels before propagating. The caller owns the container.
+        try:
+            asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
+            kc.load_connection_file()
+            kc.start_channels()
         
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                kc.wait_for_ready(timeout=10)
-                logger.info("Kernel is ready")
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Kernel not ready (attempt {attempt + 1}/{max_retries}), retrying...")
-                    time.sleep(2)
-                else:
-                    logs = subprocess.run(
-                        ['docker', 'logs', container_id],
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8',
-                        errors='replace'
-                    )
-                    self._remove_container_quietly(container_id)
-                    raise RuntimeError(f'Kernel failed to start: {e}\nContainer logs:\n{logs.stdout}\n{logs.stderr}')
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    kc.wait_for_ready(timeout=10)
+                    logger.info("Kernel is ready")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Kernel not ready (attempt {attempt + 1}/{max_retries}), retrying...")
+                        time.sleep(2)
+                    else:
+                        logs = subprocess.run(
+                            ['docker', 'logs', container_id],
+                            capture_output=True,
+                            text=True,
+                            encoding='utf-8',
+                            errors='replace'
+                        )
+                        raise RuntimeError(f'Kernel failed to start: {e}\nContainer logs:\n{logs.stdout}\n{logs.stderr}')
 
-        return kc, container_id
+        except BaseException:
+            try:
+                kc.stop_channels()
+            except Exception:
+                logger.warning('Failed to stop kernel client channels during cleanup')
+            raise
+        return kc
 
     @staticmethod
     def _remove_container_quietly(container_id: str):
