@@ -63,9 +63,11 @@ class VirtualMemoryAgent(Assistant):
             if not response:
                 # The model service may return a stream that carries no message at all,
                 # e.g. when it only sends keep-alive chunks or drops the connection early.
-                # There is nothing to detect a tool call from in that case, so stop here
-                # instead of indexing into an empty list.
-                break
+                # There is nothing to detect a tool call from, so emit the (empty)
+                # response once here -- so callers such as `run_nonstream()` still get a
+                # value -- and stop, instead of indexing into an empty list.
+                yield response
+                return
             use_tool, action, action_input, _ = self._detect_tool(response[-1])
             if use_tool:
                 observation = self._call_tool(action, action_input, messages=messages)
@@ -82,10 +84,6 @@ class VirtualMemoryAgent(Assistant):
                 yield response
             else:
                 break
-        # Always emit a final response, in the same way as FnCallAgent._run() does, so
-        # that callers such as `run_nonstream()` still get a value when the loop above
-        # exits without having yielded anything.
-        yield response
 
     def _format_file(self, messages: List[Message], lang: str = 'en') -> List[Message]:
         if lang == 'en':
