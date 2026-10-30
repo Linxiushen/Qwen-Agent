@@ -69,7 +69,11 @@ def make_agent(model, monkeypatch):
     agent = ParallelDocQA.__new__(ParallelDocQA)
     Agent.__init__(agent, llm=model, system_message=None)
     agent._parse_and_chunk_files = Mock(return_value=[{
-        'raw': [{'content': 'first excerpt'}, {'content': 'second excerpt'}]
+        'raw': [{
+            'content': 'first excerpt'
+        }, {
+            'content': 'second excerpt'
+        }]
     }])
     agent._get_files = Mock(return_value=['notes.txt'])
     agent.function_map['retrieval'] = Mock()
